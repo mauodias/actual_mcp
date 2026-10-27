@@ -279,6 +279,36 @@ docker run -i --rm \
 > ⚠️ Important: When using --enable-bearer, the BEARER_TOKEN environment variable must be set.  
 > 🔒 This is highly recommended if you're exposing your server via a public URL.
 
+### OAuth for remote MCP clients
+
+Claude's custom connectors (web, desktop and mobile) authenticate with OAuth, not a static
+bearer token. `--enable-oauth` makes the HTTP server its own single-user OAuth 2.1
+authorization server: dynamic client registration, PKCE, and a login form checked against one
+username and password that you choose (they are not your Actual credentials).
+
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -v "/path/to/state:/state" \
+  -e ACTUAL_PASSWORD="your-password" \
+  -e ACTUAL_SERVER_URL="http://your-actual-server.com" \
+  -e ACTUAL_BUDGET_SYNC_ID="your-budget-id" \
+  -e ACTUAL_MCP_ISSUER_URL="https://actual-mcp.example.com" \
+  -e ACTUAL_MCP_USER="login-you-invent" \
+  -e ACTUAL_MCP_PASSWORD="its-password" \
+  -e ACTUAL_MCP_STATE_DIR="/state" \
+  <local-image-name> \
+  --sse --enable-oauth
+```
+
+- `ACTUAL_MCP_ISSUER_URL` is the public HTTPS URL clients reach the server at; issued tokens
+  are bound to it.
+- `ACTUAL_MCP_STATE_DIR` keeps registered clients and tokens in `oauth.json`, so a restart
+  doesn't force every client to sign in again. Without it they live in memory.
+- `--enable-oauth` and `--enable-bearer` are mutually exclusive.
+
+Add the server in Claude as a custom connector with the URL `https://<issuer>/mcp`.
+
 ## Example Queries
 
 Once connected, you can ask Claude questions like:

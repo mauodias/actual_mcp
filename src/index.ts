@@ -19,6 +19,10 @@ import express, { NextFunction, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { isValidBearerToken } from './utils/bearer-auth.js';
+import { loginRouter } from './auth/login.js';
+import { SingleUserOAuthProvider } from './auth/single-user-oauth.js';
+import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { initActualApi, shutdownActualApi } from './actual-api.js';
 import { fetchAllAccounts } from './core/data/fetch-accounts.js';
 import { getActualConnection } from './integrations/actual/connection.js';
@@ -34,6 +38,7 @@ const {
     sse: useSse,
     'enable-write': enableWrite,
     'enable-bearer': enableBearer,
+    'enable-oauth': enableOauth,
     port,
     'test-resources': testResources,
     'test-custom': testCustom,
@@ -43,6 +48,7 @@ const {
     sse: { type: 'boolean', default: false },
     'enable-write': { type: 'boolean', default: false },
     'enable-bearer': { type: 'boolean', default: false },
+    'enable-oauth': { type: 'boolean', default: false },
     port: { type: 'string' },
     'test-resources': { type: 'boolean', default: false },
     'test-custom': { type: 'boolean', default: false },
@@ -94,6 +100,28 @@ const bearerAuth = (req: Request, res: Response, next: NextFunction): void => {
   }
 
   next();
+};
+
+/**
+ * Builds the single-user OAuth provider from ACTUAL_MCP_* environment variables.
+ * Exits when one is missing, since serving without auth is never what --enable-oauth means.
+ */
+const createOAuthProvider = (): { provider: SingleUserOAuthProvider; issuerUrl: URL } => {
+  const required = ['ACTUAL_MCP_ISSUER_URL', 'ACTUAL_MCP_USER', 'ACTUAL_MCP_PASSWORD'];
+  const missing = required.filter((name) => !process.env[name]);
+  if (missing.length > 0) {
+    console.error(`--enable-oauth requires ${missing.join(', ')}`);
+    process.exit(1);
+  }
+  const issuerUrl = new URL(process.env.ACTUAL_MCP_ISSUER_URL!);
+  const stateDir = process.env.ACTUAL_MCP_STATE_DIR;
+  const provider = new SingleUserOAuthProvider({
+    username: process.env.ACTUAL_MCP_USER!,
+    password: process.env.ACTUAL_MCP_PASSWORD!,
+    resourceServerUrl: issuerUrl,
+    stateFile: stateDir ? `${stateDir.replace(/\/$/, '')}/oauth.json` : undefined,
+  });
+  return { provider, issuerUrl };
 };
 
 /**
@@ -217,11 +245,28 @@ async function main(): Promise<void> {
   }
 
   if (useSse) {
+    if (enableBearer && enableOauth) {
+      console.error('--enable-bearer and --enable-oauth are mutually exclusive');
+      process.exit(1);
+    }
+
     const app = express();
     app.use(express.json());
 
-    // Log bearer auth status
-    if (enableBearer) {
+    let requireAuth = bearerAuth;
+    if (enableOauth) {
+      const { provider, issuerUrl } = createOAuthProvider();
+      // Reason: the OAuth endpoints rate-limit by client IP, and behind a reverse proxy
+      // that IP arrives in X-Forwarded-For, which Express ignores unless told to trust it.
+      app.set('trust proxy', 1);
+      app.use(mcpAuthRouter({ provider, issuerUrl, resourceName: 'Actual Budget' }));
+      app.use(loginRouter(provider));
+      requireAuth = requireBearerAuth({
+        verifier: provider,
+        resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(issuerUrl),
+      });
+      process.stderr.write(`OAuth enabled for HTTP endpoints, issuer ${issuerUrl.href}\n`);
+    } else if (enableBearer) {
       process.stderr.write('Bearer authentication enabled for SSE endpoints\n');
     } else {
       process.stderr.write('Bearer authentication disabled - endpoints are public\n');
@@ -261,11 +306,11 @@ async function main(): Promise<void> {
       });
     };
 
-    app.get('/sse', bearerAuth, handleLegacySse);
+    app.get('/sse', requireAuth, handleLegacySse);
 
     const streamablePaths = ['/', '/mcp'];
 
-    app.all(streamablePaths, bearerAuth, async (req: Request, res: Response) => {
+    app.all(streamablePaths, requireAuth, async (req: Request, res: Response) => {
       const sessionHeader = parseSessionHeader(req.headers['mcp-session-id']);
       if (req.method === 'GET' && !sessionHeader && req.headers.accept?.includes('text/event-stream')) {
         handleLegacySse(req, res);
@@ -347,7 +392,7 @@ async function main(): Promise<void> {
       }
     });
 
-    app.post('/messages', bearerAuth, async (req: Request, res: Response) => {
+    app.post('/messages', requireAuth, async (req: Request, res: Response) => {
       const connectionId = req.query.connectionId as string | undefined;
       const conn = connectionId ? legacySseConnections.get(connectionId) : undefined;
       if (conn) {
